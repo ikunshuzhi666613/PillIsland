@@ -22,6 +22,206 @@ struct NowPlayingTrack {
 
 // MARK: - Now playing monitor (Streams MediaRemote via the BSD-licensed adapter)
 
+
+struct LyricLine {
+    let time: TimeInterval
+    let text: String
+}
+
+final class LyricsStore {
+    static let shared = LyricsStore()
+    private var cache: [String: [LyricLine]] = [:]
+    private var pending: Set<String> = []
+    private let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 8
+        return URLSession(configuration: config)
+    }()
+
+    private func request(_ url: URL, referer: String?, completion: @escaping (Data?) -> Void) {
+        var req = URLRequest(url: url)
+        req.setValue("PillIsland/1.3 (https://github.com/ikunshuzhi666613/PillIsland)",
+                     forHTTPHeaderField: "User-Agent")
+        if let referer = referer {
+            req.setValue(referer, forHTTPHeaderField: "Referer")
+        }
+        session.dataTask(with: req) { data, _, _ in
+            DispatchQueue.main.async { completion(data) }
+        }.resume()
+    }
+
+    func lyrics(title: String, artist: String, completion: @escaping ([LyricLine]) -> Void) {
+        let key = "\(title)|\(artist)".lowercased()
+        if let cached = cache[key] { completion(cached); return }
+        guard !pending.contains(key) else { return }
+        pending.insert(key)
+
+        let allowed = CharacterSet.alphanumerics
+        let queryText = artist.isEmpty ? title : "\(title) \(artist)"
+        guard let query = queryText.addingPercentEncoding(withAllowedCharacters: allowed) else {
+            pending.remove(key)
+            completion([])
+            return
+        }
+
+        func finish(_ lines: [LyricLine]) {
+            self.pending.remove(key)
+            self.cache[key] = lines
+            completion(lines)
+        }
+
+        // NetEase first: the song is playing from it, so its catalogue matches.
+        neteaseSearch(query, title: title, artist: artist) { [weak self] ids in
+            guard let self = self else { return }
+            self.tryNetease(ids, index: 0) { lines in
+                if !lines.isEmpty {
+                    finish(lines)
+                    return
+                }
+                self.lrclib(title: title, artist: artist) { fallback in
+                    finish(fallback)
+                }
+            }
+        }
+    }
+
+    private func neteaseSearch(_ query: String, title: String, artist: String, completion: @escaping ([Int]) -> Void) {
+        guard let url = URL(string: "https://music.163.com/api/search/get?s=\(query)&type=1&limit=5") else {
+            completion([])
+            return
+        }
+        request(url, referer: "https://music.163.com") { data in
+            guard let data = data,
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let result = root["result"] as? [String: Any],
+                  let songs = result["songs"] as? [[String: Any]] else {
+                completion([])
+                return
+            }
+            let needle = title.lowercased()
+            var scored: [(Int, Int)] = []
+            for song in songs {
+                guard let id = song["id"] as? Int, let name = song["name"] as? String else { continue }
+                let lower = name.lowercased()
+                var score = 0
+                if lower == needle {
+                    score += 100
+                } else if lower.contains(needle) || needle.contains(lower) {
+                    score += 50
+                } else {
+                    continue
+                }
+                let artists = (song["artists"] as? [[String: Any]])?
+                    .compactMap { $0["name"] as? String } ?? []
+                for name in artists {
+                    let a = name.lowercased()
+                    if artist.lowercased().contains(a) || a.contains(artist.lowercased()) {
+                        score += 20
+                    }
+                }
+                scored.append((id, score))
+            }
+            completion(scored.sorted { $0.1 > $1.1 }.map { $0.0 })
+        }
+    }
+
+    private func tryNetease(_ ids: [Int], index: Int, completion: @escaping ([LyricLine]) -> Void) {
+        guard index < ids.count, index < 3 else {
+            completion([])
+            return
+        }
+        guard let url = URL(string: "https://music.163.com/api/song/lyric?os=pc&id=\(ids[index])&lv=-1&kv=-1&tv=-1") else {
+            completion([])
+            return
+        }
+        request(url, referer: "https://music.163.com") { [weak self] data in
+            guard let self = self else { return }
+            var lines: [LyricLine] = []
+            if let data = data,
+               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let lrc = root["lrc"] as? [String: Any],
+               let text = lrc["lyric"] as? String {
+                lines = LyricsStore.parseLRC(text)
+            }
+            if lines.isEmpty {
+                self.tryNetease(ids, index: index + 1, completion: completion)
+            } else {
+                completion(lines)
+            }
+        }
+    }
+
+    private func lrclib(title: String, artist: String, completion: @escaping ([LyricLine]) -> Void) {
+        let allowed = CharacterSet.alphanumerics
+        guard let track = title.addingPercentEncoding(withAllowedCharacters: allowed) else {
+            completion([])
+            return
+        }
+        var urlString = "https://lrclib.net/api/search?track_name=\(track)"
+        if let performer = artist.addingPercentEncoding(withAllowedCharacters: allowed), !artist.isEmpty {
+            urlString += "&artist_name=\(performer)"
+        }
+        guard let url = URL(string: urlString) else {
+            completion([])
+            return
+        }
+        request(url, referer: nil) { data in
+            completion(LyricsStore.parseLRCLIB(data, title: title))
+        }
+    }
+
+    private static func parseLRCLIB(_ data: Data?, title: String) -> [LyricLine] {
+        guard let data = data,
+              let results = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        let lowerTitle = title.lowercased()
+        let sorted = results.sorted { a, b in
+            let aExact = ((a["trackName"] as? String)?.lowercased() == lowerTitle) ? 0 : 1
+            let bExact = ((b["trackName"] as? String)?.lowercased() == lowerTitle) ? 0 : 1
+            return aExact < bExact
+        }
+        for item in sorted {
+            if let synced = item["syncedLyrics"] as? String, !synced.isEmpty {
+                let parsed = LyricsStore.parseLRC(synced)
+                if !parsed.isEmpty { return parsed }
+            }
+        }
+        return []
+    }
+
+    static func parseLRC(_ text: String) -> [LyricLine] {
+        var offset: Double = 0
+        var lines: [LyricLine] = []
+        let regex = try? NSRegularExpression(pattern: "\\[(\\d{1,2}):(\\d{1,2})(?:[.:](\\d{1,3}))?\\]", options: [])
+
+        for raw in text.components(separatedBy: .newlines) {
+            let trimmed = raw.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[offset:") {
+                let digits = trimmed.components(separatedBy: ":").last?.replacingOccurrences(of: "]", with: "") ?? "0"
+                offset = (Double(digits) ?? 0) / 1000.0
+                continue
+            }
+            let ns = raw as NSString
+            guard let regex = regex else { continue }
+            let matches = regex.matches(in: raw, range: NSRange(location: 0, length: ns.length))
+            guard let last = matches.last else { continue }
+            let lyric = ns.substring(from: last.range.location + last.range.length)
+                .trimmingCharacters(in: .whitespaces)
+            for match in matches {
+                let minute = Double(ns.substring(with: match.range(at: 1))) ?? 0
+                let second = Double(ns.substring(with: match.range(at: 2))) ?? 0
+                var fraction = 0.0
+                if match.range(at: 3).location != NSNotFound {
+                    fraction = (Double(ns.substring(with: match.range(at: 3))) ?? 0) / 1000.0
+                }
+                lines.append(LyricLine(time: minute * 60 + second + fraction + offset, text: lyric))
+            }
+        }
+        return lines.sorted { $0.time < $1.time }
+    }
+}
+
 final class NowPlayingMonitor {
     var onChange: ((NowPlayingTrack?) -> Void)?
 
@@ -389,9 +589,12 @@ final class PillView: NSView {
     private var siriSpecs: [(radius: CGFloat, size: CGFloat)] = []
 
     private let artStage = CALayer()
+    private let flipContainer = CALayer()
     private let dimOverlay = CALayer()
     private let artworkLayer = CALayer()
     private let titleLayer = CATextLayer()
+    private let lyricLayer = CATextLayer()
+    private let textBlurLayer = CALayer()
     private let artistLayer = CATextLayer()
     private var equalizer: [CALayer] = []
     private var barBase: [CGFloat] = []
@@ -420,6 +623,15 @@ final class PillView: NSView {
 
     private var controls: [CALayer] = []
     private var controlFrames: [CGRect] = []
+    private var controlHighlights: [CALayer] = []
+    private var skipStrips: [Int: (clip: CALayer, inner: CALayer)] = [:]
+    private var pressedControlIndex: Int?
+    private var lastIconPlaying: Bool?
+    private var skipGuardUntil = Date.distantPast
+    private var lastVisibilityMode: Mode?
+    private var collapsePhase = false
+    private var pendingIconUntil = Date.distantPast
+    private var expectedIconPlaying: Bool?
     private let controlCommands = [5, 2, 4]
 
     var onCommand: ((Int) -> Void)?
@@ -439,6 +651,10 @@ final class PillView: NSView {
     private var baseElapsed: Double = 0
     private var baseDate = Date()
     private var lastTrackID = ""
+    private var lyrics: [LyricLine] = []
+    private var lyricsKey = ""
+    private var currentLyricIndex = -1
+    private var lyricRevealDate = Date()
     private var lastPlaying = false
     private var resyncBlockedUntil = Date.distantPast
 
@@ -452,7 +668,10 @@ final class PillView: NSView {
     private enum Mode { case idle, siri, compact, card }
 
     private var mode: Mode {
-        if track != nil && !dormant { return hovered ? .card : .compact }
+        if track != nil && !dormant {
+            if collapsePhase { return .idle }
+            return hovered ? .card : .compact
+        }
         return .idle
     }
 
@@ -490,22 +709,28 @@ final class PillView: NSView {
 
         artStage.cornerCurve = .continuous
         artStage.masksToBounds = true
+        flipContainer.cornerCurve = .continuous
+        flipContainer.masksToBounds = true
+        var stagePerspective = CATransform3DIdentity
+        stagePerspective.m34 = -1.0 / 420.0
+        artStage.sublayerTransform = stagePerspective
         artStage.opacity = 0
         pill.addSublayer(artStage)
+        artStage.addSublayer(flipContainer)
 
         artworkLayer.contentsGravity = .resizeAspectFill
         artworkLayer.backgroundColor = NSColor(calibratedWhite: 0.10, alpha: 1.0).cgColor
         artworkLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
-        artStage.addSublayer(artworkLayer)
+        flipContainer.addSublayer(artworkLayer)
 
         blurOverlay.contentsGravity = .resizeAspectFill
         blurOverlay.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
         blurOverlay.opacity = 0
-        artStage.addSublayer(blurOverlay)
+        flipContainer.addSublayer(blurOverlay)
 
         dimOverlay.backgroundColor = NSColor.black.cgColor
         dimOverlay.opacity = 0
-        artStage.addSublayer(dimOverlay)
+        flipContainer.addSublayer(dimOverlay)
 
         prepareText(titleLayer, alignment: .left)
         prepareText(artistLayer, alignment: .left)
@@ -513,6 +738,18 @@ final class PillView: NSView {
         artistLayer.opacity = 0
         pill.addSublayer(titleLayer)
         pill.addSublayer(artistLayer)
+
+        lyricLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
+        lyricLayer.alignmentMode = .left
+        lyricLayer.truncationMode = .none
+        lyricLayer.opacity = 0
+        pill.addSublayer(lyricLayer)
+
+        textBlurLayer.contentsGravity = .resize
+        textBlurLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
+        textBlurLayer.opacity = 0
+        pill.addSublayer(textBlurLayer)
+
 
         for _ in 0..<6 {
             let bar = CALayer()
@@ -556,6 +793,73 @@ final class PillView: NSView {
             controlFrames.append(.zero)
         }
 
+        for index in [0, 2] {
+            controls[index].contents = nil
+
+            let clip = CALayer()
+            clip.bounds = CGRect(x: 0, y: 0, width: 32, height: 30)
+            clip.masksToBounds = true
+            clip.position = controls[index].position
+            clip.opacity = 0
+
+            let inner = CALayer()
+            inner.bounds = CGRect(x: 0, y: 0, width: 32, height: 30)
+            inner.position = CGPoint(x: 16, y: 15)
+            clip.addSublayer(inner)
+
+            let triWidth: CGFloat = 16
+            let triHeight: CGFloat = 20
+            let spacing: CGFloat = 16
+            let radius: CGFloat = 1.4
+            let pointRight = (index == 2)
+
+            for step in 0..<4 {
+                let triangle = CAShapeLayer()
+                triangle.bounds = CGRect(x: 0, y: 0, width: triWidth, height: triHeight)
+                triangle.position = CGPoint(x: 16 + (CGFloat(step) - 1.5) * spacing, y: 15)
+
+                let path = CGMutablePath()
+                let bottom = CGPoint(x: 0, y: 0)
+                let top = CGPoint(x: 0, y: triHeight)
+                let tip = CGPoint(x: triWidth, y: triHeight / 2)
+
+                func roundedCorner(_ vertex: CGPoint, _ next: CGPoint) {
+                    path.addArc(tangent1End: vertex, tangent2End: next, radius: radius)
+                }
+
+                if pointRight {
+                    path.move(to: CGPoint(x: 0, y: radius))
+                    roundedCorner(top, tip)
+                    roundedCorner(tip, bottom)
+                    roundedCorner(bottom, top)
+                } else {
+                    path.move(to: CGPoint(x: triWidth, y: radius))
+                    path.addArc(tangent1End: CGPoint(x: triWidth, y: triHeight),
+                                tangent2End: CGPoint(x: 0, y: triHeight / 2), radius: radius)
+                    path.addArc(tangent1End: CGPoint(x: 0, y: triHeight / 2),
+                                tangent2End: CGPoint(x: triWidth, y: 0), radius: radius)
+                    path.addArc(tangent1End: CGPoint(x: triWidth, y: 0),
+                                tangent2End: CGPoint(x: triWidth, y: triHeight), radius: radius)
+                }
+                path.closeSubpath()
+
+                triangle.path = path
+                triangle.fillColor = NSColor.white.cgColor
+                inner.addSublayer(triangle)
+            }
+
+            pill.addSublayer(clip)
+            skipStrips[index] = (clip, inner)
+        }
+
+        for _ in 0..<controlNames.count {
+            let highlight = CALayer()
+            highlight.backgroundColor = NSColor(white: 0.55, alpha: 0.32).cgColor
+            highlight.opacity = 0
+            pill.addSublayer(highlight)
+            controlHighlights.append(highlight)
+        }
+
         // Pre-lay-out the card state so the very first expansion has no
         // stray frame animations pulling content out of (0, 0).
         CATransaction.begin()
@@ -570,6 +874,7 @@ final class PillView: NSView {
             self.updateEqualizerBars()
             if self.mode == .card, !self.seeking {
                 self.updateProgressUI()
+                self.updateLyricLine()
             }
         }
         if let timer = progressTimer {
@@ -767,6 +1072,10 @@ final class PillView: NSView {
             lastPlaying = t.playing
         }
 
+        if let t = newTrack, "\(t.title)|\(t.artist)" != lyricsKey {
+            requestLyrics(for: t)
+        }
+
         if let t = newTrack, t.elapsed != lastRawElapsed {
             lastRawElapsed = t.elapsed
             lastRawElapsedAt = Date()
@@ -805,6 +1114,78 @@ final class PillView: NSView {
         }
     }
 
+    private func openPlayerApp() {
+        guard let bundle = track?.bundleIdentifier, !bundle.isEmpty else { return }
+        if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundle).first {
+            app.activate(options: [.activateAllWindows])
+        } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func requestLyrics(for t: NowPlayingTrack) {
+        let key = "\(t.title)|\(t.artist)"
+        lyricsKey = key
+        lyrics = []
+        currentLyricIndex = -1
+        lyricRevealDate = Date().addingTimeInterval(1.5)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        lyricLayer.string = ""
+        lyricLayer.opacity = 0
+        titleLayer.opacity = 1
+        CATransaction.commit()
+
+        LyricsStore.shared.lyrics(title: t.title, artist: t.artist) { [weak self] lines in
+            guard let self = self, self.lyricsKey == key else { return }
+            self.lyrics = lines
+            self.currentLyricIndex = -1
+            if self.mode == .card {
+                self.updateLyricLine()
+            }
+        }
+    }
+
+    private func updateLyricLine() {
+        guard mode == .card, !lyrics.isEmpty else { return }
+
+        // Keep the song title on screen for a moment before the lyric takes over.
+        if Date() < lyricRevealDate {
+            if currentLyricIndex != -1 {
+                currentLyricIndex = -1
+                CATransaction.begin()
+                CATransaction.setAnimationDuration(0.16)
+                titleLayer.opacity = 1
+                lyricLayer.opacity = 0
+                CATransaction.commit()
+            }
+            return
+        }
+        let now = currentElapsed()
+        var index = -1
+        for (i, line) in lyrics.enumerated() {
+            if line.time <= now + 0.15 { index = i } else { break }
+        }
+        guard index != currentLyricIndex else { return }
+        currentLyricIndex = index
+
+        let text = index >= 0 ? lyrics[index].text : ""
+        let font = NSFont.systemFont(ofSize: 13, weight: .bold)
+        let display = text.isEmpty ? "" : fitted(text, font: font, width: 156)
+        let hasLyric = !display.isEmpty
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.16)
+        lyricLayer.opacity = hasLyric ? 1 : 0
+        titleLayer.opacity = hasLyric ? 0 : 1
+        CATransaction.commit()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        lyricLayer.string = NSAttributedString(string: display,
+                                               attributes: [.font: font,
+                                                            .foregroundColor: NSColor(white: 1, alpha: 0.88)])
+        CATransaction.commit()
+    }
+
     private func updateMusicLayers(_ t: NowPlayingTrack) {
         let titleAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
@@ -819,7 +1200,7 @@ final class PillView: NSView {
         CATransaction.setDisableActions(true)
         titleLayer.string = NSAttributedString(string: fitted(t.title, font: NSFont.systemFont(ofSize: 14, weight: .semibold), width: 150), attributes: titleAttrs)
         artistLayer.string = NSAttributedString(string: fitted(t.artist, font: NSFont.systemFont(ofSize: 11.5, weight: .regular), width: 150), attributes: artistAttrs)
-        controls[1].contents = symbolImage(t.playing ? "pause.fill" : "play.fill", pointSize: 30)
+        updatePlayPauseIcon(t.playing)
         CATransaction.commit()
 
         if t.artworkToken != lastArtworkToken {
@@ -902,12 +1283,11 @@ final class PillView: NSView {
     private func flipArtwork(to image: CGImage) {
         let half = 0.30
         let newBlurred = blurredImage(image, radius: 16)
-        blurOverlay.removeAnimation(forKey: "flipIn")
-        blurOverlay.removeAnimation(forKey: "flipOut")
+        flipContainer.removeAnimation(forKey: "flipOut")
+        flipContainer.removeAnimation(forKey: "flipIn")
         blurOverlay.contents = currentBlurredArtwork
         currentBlurredArtwork = newBlurred
         startBlurRamp(total: half * 2)
-        artworkLayer.removeAnimation(forKey: "flipOut")
 
         let out = CABasicAnimation(keyPath: "transform.rotation.y")
         out.fromValue = 0.0
@@ -921,7 +1301,7 @@ final class PillView: NSView {
         CATransaction.setAnimationDuration(half)
         CATransaction.setCompletionBlock { [weak self] in
             guard let self = self else { return }
-            self.artworkLayer.removeAnimation(forKey: "flipOut")
+            self.flipContainer.removeAnimation(forKey: "flipOut")
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             self.artworkLayer.contents = image
@@ -934,13 +1314,12 @@ final class PillView: NSView {
             incoming.toValue = 0.0
             incoming.duration = half
             incoming.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            self.artworkLayer.add(incoming, forKey: "flipIn")
-            self.blurOverlay.add(incoming, forKey: "flipIn")
+            self.flipContainer.add(incoming, forKey: "flipIn")
         }
-        artworkLayer.add(out, forKey: "flipOut")
-        blurOverlay.add(out, forKey: "flipOut")
+        flipContainer.add(out, forKey: "flipOut")
         CATransaction.commit()
     }
+
 
     private func updateArtworkPlaybackState(_ playing: Bool) {
         guard playing != lastPlaybackState else { return }
@@ -1082,9 +1461,13 @@ final class PillView: NSView {
 
     private func layoutCompact() {
         artStage.cornerRadius = 6
+        flipContainer.cornerRadius = 6
+        artworkLayer.cornerRadius = 6
+        blurOverlay.cornerRadius = 6
         artStage.bounds = CGRect(x: 0, y: 0, width: 18, height: 18)
         artStage.position = CGPoint(x: 14, y: 13)
         let small = CGRect(origin: .zero, size: artStage.bounds.size)
+        flipContainer.frame = small
         artworkLayer.frame = small
         blurOverlay.frame = small
         dimOverlay.frame = small
@@ -1098,14 +1481,21 @@ final class PillView: NSView {
 
     private func layoutCard() {
         artStage.cornerRadius = 12
+        flipContainer.cornerRadius = 12
+        artworkLayer.cornerRadius = 12
+        blurOverlay.cornerRadius = 12
         artStage.bounds = CGRect(x: 0, y: 0, width: 54, height: 54)
         artStage.position = CGPoint(x: 43, y: 116)
         let large = CGRect(origin: .zero, size: artStage.bounds.size)
+        flipContainer.frame = large
         artworkLayer.frame = large
         blurOverlay.frame = large
         dimOverlay.frame = large
         titleLayer.frame = CGRect(x: 82, y: 105, width: 156, height: 18)
         artistLayer.frame = CGRect(x: 82, y: 89, width: 156, height: 14)
+        lyricLayer.frame = CGRect(x: 82, y: 103, width: 156, height: 20)
+        textBlurLayer.frame = CGRect(x: 82, y: 87, width: 158, height: 38)
+
 
         let cardHeights: [CGFloat] = [8, 11, 14, 14, 11, 8]
         barBase = cardHeights
@@ -1127,47 +1517,67 @@ final class PillView: NSView {
             button.position = CGPoint(x: slots[index], y: 28)
             controlFrames[index] = CGRect(x: slots[index] - w / 2, y: 28 - h / 2, width: w, height: h)
         }
+
+        for (index, strip) in skipStrips {
+            strip.clip.position = controls[index].position
+            strip.clip.opacity = 1
+        }
     }
 
     private func updateVisibility(animated: Bool) {
         let hasTrack = track != nil
         let isCard = (mode == .card)
-
         CATransaction.begin()
         CATransaction.setAnimationDuration(animated ? 0.16 : 0)
         if !animated { CATransaction.setDisableActions(true) }
-
         siriContainer.opacity = (mode == .siri) ? 1.0 : 0.0
-        for bar in equalizer {
-            bar.opacity = (hasTrack && !dormant) ? 1.0 : 0.0
+        if !collapsePhase {
+            for bar in equalizer {
+                bar.opacity = (hasTrack && !dormant) ? 1.0 : 0.0
+            }
+            artStage.opacity = (hasTrack && !dormant) ? 1.0 : 0.0
         }
-        artStage.opacity = (hasTrack && !isCard && !dormant) ? 1.0 : 0.0
-
         CATransaction.commit()
 
         CATransaction.begin()
         if isCard {
             CATransaction.setAnimationDuration(0.14)
-            artStage.opacity = 1
-            titleLayer.opacity = 1
-            artistLayer.opacity = 1
             progressTrack.opacity = 1
             progressFill.opacity = 1
             elapsedLabel.opacity = 1
             remainingLabel.opacity = 1
             for button in controls { button.opacity = 1 }
-        } else {
+            for (_, strip) in skipStrips { strip.clip.opacity = 1 }
+
+            // Nothing is drawn over the camera band while the card grows; the
+            // text only fades in once it can sit below that band.
             CATransaction.setDisableActions(true)
             titleLayer.opacity = 0
             artistLayer.opacity = 0
+            textBlurLayer.opacity = 0
+            CATransaction.commit()
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { [weak self] in
+                guard let self = self, self.mode == .card else { return }
+                self.fadeInCardContent()
+            }
+        } else {
+            CATransaction.setDisableActions(true)
+            if pressedControlIndex != nil { pressedControlIndex = nil }
+            for highlight in controlHighlights { highlight.opacity = 0 }
+            for (_, strip) in skipStrips { strip.clip.opacity = 0 }
+            titleLayer.opacity = 0
+            artistLayer.opacity = 0
+            textBlurLayer.opacity = 0
+            lyricLayer.opacity = 0
             progressTrack.opacity = 0
             progressFill.opacity = 0
             elapsedLabel.opacity = 0
             remainingLabel.opacity = 0
+            blurOverlay.opacity = 0
             for button in controls { button.opacity = 0 }
+            CATransaction.commit()
         }
-        blurOverlay.opacity = 0
-        CATransaction.commit()
     }
 
 
@@ -1208,15 +1618,305 @@ final class PillView: NSView {
 
 
 
+    private func updatePlayPauseIcon(_ playing: Bool) {
+        // Switching tracks briefly reports "paused"; don't let that flip the
+        // pause icon. Only a real user pause should change it.
+        guard Date() >= skipGuardUntil else { return }
+        if Date() < pendingIconUntil, let expected = expectedIconPlaying, playing != expected {
+            // A rapid tap flipped the expected state; ignore stale reports.
+            return
+        }
+        guard lastIconPlaying != playing else { return }
+        let firstTime = (lastIconPlaying == nil)
+        lastIconPlaying = playing
+        let image = symbolImage(playing ? "pause.fill" : "play.fill", pointSize: 30)
+        let button = controls[1]
+
+        if firstTime {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            button.contents = image
+            CATransaction.commit()
+            return
+        }
+
+        button.removeAnimation(forKey: "iconSpring")
+
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.07)
+        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeIn))
+        button.transform = CATransform3DMakeScale(0.15, 0.15, 1)
+        button.opacity = 0
+        CATransaction.commit()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.07) { [weak self] in
+            guard let self = self else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            button.contents = image
+            button.opacity = 1
+            button.transform = CATransform3DMakeScale(0.15, 0.15, 1)
+            CATransaction.commit()
+
+            let spring = CASpringAnimation(keyPath: "transform.scale")
+            spring.fromValue = 0.15
+            spring.toValue = 1.0
+            spring.mass = 1
+            spring.stiffness = 380
+            spring.damping = 24
+            spring.initialVelocity = 1
+            spring.duration = spring.settlingDuration
+            button.add(spring, forKey: "iconSpring")
+
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            button.transform = CATransform3DIdentity
+            CATransaction.commit()
+        }
+    }
+
+    private func beginPress(_ index: Int) {
+        guard controlFrames.indices.contains(index),
+              controlHighlights.indices.contains(index) else { return }
+
+        let frame = controlFrames[index]
+        let extra: CGFloat = (index == 1) ? 16 : 9
+        let size = max(frame.width, frame.height) + extra
+        let highlight = controlHighlights[index]
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        highlight.bounds = CGRect(x: 0, y: 0, width: size, height: size)
+        highlight.position = CGPoint(x: frame.midX, y: frame.midY)
+        highlight.cornerRadius = size / 2
+        highlight.transform = CATransform3DMakeScale(0.7, 0.7, 1)
+        CATransaction.commit()
+
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.10)
+        highlight.opacity = 1
+        highlight.transform = CATransform3DIdentity
+        if index == 1 {
+            controls[index].transform = CATransform3DMakeScale(0.86, 0.86, 1)
+        } else if let strip = skipStrips[index] {
+            CATransaction.setAnimationDuration(0.08)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .linear))
+            strip.clip.transform = CATransform3DMakeScale(0.85, 0.85, 1)
+        }
+        CATransaction.commit()
+    }
+
+    private func playSkipAdvance(_ index: Int) {
+        skipGuardUntil = Date().addingTimeInterval(1.0)
+        guard let strip = skipStrips[index] else { return }
+        let dx: CGFloat = (index == 0) ? -16 : 16
+        let inner = strip.inner
+
+        let start = CGPoint(x: 16, y: 15)
+        let target = CGPoint(x: 16 + dx, y: 15)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        inner.position = start
+        CATransaction.commit()
+
+        let spring = CASpringAnimation(keyPath: "position")
+        spring.fromValue = NSValue(point: start)
+        spring.toValue = NSValue(point: target)
+        spring.mass = 1
+        spring.stiffness = 360
+        spring.damping = 26
+        spring.initialVelocity = 2
+        spring.duration = spring.settlingDuration
+        inner.add(spring, forKey: "advance")
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        inner.position = target
+        CATransaction.commit()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + spring.settlingDuration + 0.02) { [weak self] in
+            guard let self = self else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self.skipStrips[index]?.inner.position = start
+            CATransaction.commit()
+        }
+    }
+
+    private func endPress() {
+        guard let index = pressedControlIndex else { return }
+        pressedControlIndex = nil
+
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.16)
+        if controlHighlights.indices.contains(index) {
+            controlHighlights[index].opacity = 0
+            controlHighlights[index].transform = CATransform3DMakeScale(1.18, 1.18, 1)
+        }
+
+        if index == 1 {
+            controls[index].transform = CATransform3DIdentity
+        } else {
+            CATransaction.setDisableActions(true)
+            controls[index].transform = CATransform3DIdentity
+            controls[index].opacity = 1
+            skipStrips[index]?.clip.transform = CATransform3DIdentity
+        }
+        CATransaction.commit()
+    }
+
+
+
+
+    private func refreshTextBlur() {
+        guard let t = track else {
+            textBlurLayer.contents = nil
+            return
+        }
+        let w: CGFloat = 158
+        let h: CGFloat = 38
+        let scale: CGFloat = 2
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                         pixelsWide: Int(w * scale), pixelsHigh: Int(h * scale),
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                         isPlanar: false, colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0) else { return }
+        rep.size = NSSize(width: w, height: h)
+        NSGraphicsContext.saveGraphicsState()
+        if let ctx = NSGraphicsContext(bitmapImageRep: rep) {
+            NSGraphicsContext.current = ctx
+            let titleFont = NSFont.systemFont(ofSize: 14, weight: .semibold)
+            let title = NSAttributedString(string: fitted(t.title, font: titleFont, width: w - 2),
+                                           attributes: [.font: titleFont, .foregroundColor: NSColor.white])
+            title.draw(at: NSPoint(x: 0, y: 18))
+            let artistFont = NSFont.systemFont(ofSize: 11.5, weight: .regular)
+            let artist = NSAttributedString(string: fitted(t.artist, font: artistFont, width: w - 2),
+                                            attributes: [.font: artistFont, .foregroundColor: NSColor(white: 1, alpha: 0.55)])
+            artist.draw(at: NSPoint(x: 0, y: 2))
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard let cg = rep.cgImage else { return }
+        let input = CIImage(cgImage: cg)
+        guard let filter = CIFilter(name: "CIGaussianBlur") else { return }
+        filter.setValue(input, forKey: kCIInputImageKey)
+        filter.setValue(5.0, forKey: kCIInputRadiusKey)
+        guard let output = filter.outputImage?.cropped(to: input.extent),
+              let blurred = ciContext.createCGImage(output, from: input.extent) else { return }
+        textBlurLayer.contents = blurred
+    }
+
+    private func fadeInCardContent() {
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.12)
+        titleLayer.opacity = 1
+        artistLayer.opacity = 1
+        textBlurLayer.opacity = 0
+        progressTrack.opacity = 1
+        progressFill.opacity = 1
+        elapsedLabel.opacity = 1
+        remainingLabel.opacity = 1
+        for button in controls { button.opacity = 1 }
+        CATransaction.commit()
+
+        // Re-apply the lyric line: the title must stay hidden if one is active.
+        currentLyricIndex = -2
+        updateLyricLine()
+    }
+
     private func setHovered(_ value: Bool) {
         // Idle island no longer reacts to hover; only playback expands it.
         guard track != nil, !dormant else { return }
         guard value != hovered else { return }
         hovered = value
-        if value, track != nil { onNeedSync?() }
+
+        if value {
+            collapsePhase = false
+            // If the collapse pop was interrupted, the artwork may be left
+            // scaled down; always restore it when the card opens.
+            let scale: CGFloat = (track?.playing == true) ? 1.0 : 0.88
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            artStage.transform = CATransform3DMakeScale(scale, scale, 1)
+            CATransaction.commit()
+            onNeedSync?()
+            syncWindow()
+            layoutContents(animated: true, spring: true)
+            updateVisibility(animated: true)
+            return
+        }
+
+        // Collapse in two beats: card -> small idle pill -> compact with media.
+        collapsePhase = true
+
+        // The cover first blurs, then dissolves instead of just flying away.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        blurOverlay.contents = currentBlurredArtwork
+        blurOverlay.opacity = 0
+        CATransaction.commit()
+
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.14)
+        blurOverlay.opacity = 1
+        CATransaction.commit()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { [weak self] in
+            guard let self = self, self.collapsePhase, self.mode != .card else { return }
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.16)
+            self.artStage.opacity = 0
+            self.artStage.transform = CATransform3DMakeScale(0.2, 0.2, 1)
+            self.blurOverlay.opacity = 0
+            for bar in self.equalizer { bar.opacity = 0 }
+            CATransaction.commit()
+        }
+
         syncWindow()
-        layoutContents(animated: true, spring: true)
+        layoutContents(animated: true)
         updateVisibility(animated: true)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.34) { [weak self] in
+            guard let self = self, self.collapsePhase else { return }
+            self.collapsePhase = false
+
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self.artStage.opacity = 0
+            self.artStage.transform = CATransform3DMakeScale(0.35, 0.35, 1)
+            CATransaction.commit()
+
+            self.layoutContents(animated: true, spring: true)
+
+            // Do not let the artwork travel from the card position; it should
+            // reappear in place at compact size.
+            self.artStage.removeAnimation(forKey: "position")
+            self.artStage.removeAnimation(forKey: "bounds")
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self.artStage.bounds = CGRect(x: 0, y: 0, width: 18, height: 18)
+            self.artStage.position = CGPoint(x: 14, y: 13)
+            CATransaction.commit()
+
+            self.updateVisibility(animated: true)
+
+            let target: CGFloat = (self.track?.playing == true) ? 1.0 : 0.88
+            self.artStage.transform = CATransform3DMakeScale(0.35, 0.35, 1)
+            let spring = CASpringAnimation(keyPath: "transform.scale")
+            spring.fromValue = 0.35
+            spring.toValue = target
+            spring.mass = 1
+            spring.stiffness = 380
+            spring.damping = 15
+            spring.initialVelocity = 3
+            spring.duration = spring.settlingDuration
+            self.artStage.add(spring, forKey: "popIn")
+
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self.artStage.transform = CATransform3DMakeScale(target, target, 1)
+            CATransaction.commit()
+        }
     }
 
     override func updateTrackingAreas() {
@@ -1289,8 +1989,14 @@ final class PillView: NSView {
         let frame = pillFrame
         let local = CGPoint(x: point.x - frame.minX, y: point.y - frame.minY)
 
+        if mode == .card, CGRect(x: 16, y: 89, width: 54, height: 54).contains(local) {
+            openPlayerApp()
+            return
+        }
+
         for (index, controlFrame) in controlFrames.enumerated() where controlFrame.insetBy(dx: -6, dy: -6).contains(local) {
-            onCommand?(controlCommands[index])
+            pressedControlIndex = index
+            beginPress(index)
             return
         }
 
@@ -1302,6 +2008,16 @@ final class PillView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if let index = pressedControlIndex {
+            let point = convert(event.locationInWindow, from: nil)
+            let frame = pillFrame
+            let local = CGPoint(x: point.x - frame.minX, y: point.y - frame.minY)
+            if !controlFrames[index].insetBy(dx: -8, dy: -8).contains(local) {
+                endPress()
+            }
+            return
+        }
+
         guard seeking, let t = track else { return }
         let point = convert(event.locationInWindow, from: nil)
         let frame = pillFrame
@@ -1312,6 +2028,28 @@ final class PillView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let index = pressedControlIndex {
+            let point = convert(event.locationInWindow, from: nil)
+            let frame = pillFrame
+            let local = CGPoint(x: point.x - frame.minX, y: point.y - frame.minY)
+            let stillInside = controlFrames[index].insetBy(dx: -8, dy: -8).contains(local)
+            endPress()
+            if stillInside {
+                if index == 1 {
+                    // Flip the icon immediately so the animation is not late.
+                    let current = lastIconPlaying ?? (track?.playing ?? false)
+                    expectedIconPlaying = !current
+                    pendingIconUntil = Date().addingTimeInterval(0.9)
+                    updatePlayPauseIcon(!current)
+                    updateArtworkPlaybackState(!current)
+                } else {
+                    playSkipAdvance(index)
+                }
+                onCommand?(controlCommands[index])
+            }
+            return
+        }
+
         guard seeking else { return }
         guard let t = track else {
             seeking = false
